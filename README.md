@@ -11,8 +11,8 @@ A short warm-up task for getting participants used to an eye tracker (SCI 6384, 
 1. Follow the dot: 9 positions, 1.5 s each (accuracy check against the tracker)
 2. Practice: 2 trials with feedback
 3. Round 1, easy: clear kiki vs. bouba, keys `F` / `J`
-4. Round 2, medium: half-spiky vs. half-round, keys `F` / `J`
-5. Round 3, hard: 4 shapes, only one has a sharp point, keys `D` `F` `J` `K`
+4. Round 2, varied: kikis and boubas with different spike counts, sizes, irregularity and rotation, keys `F` / `J`
+5. Round 3, sort: one shape at a time goes into the KIKI house or the BOUBA house (keys `F` / `J`, or mouse drag). Shapes run from round to spiky, plus hybrids that are half spiky, half round. Ambiguous shapes have no right answer: the point is to see which features people look at before deciding
 6. Results screen with CSV / JSON download
 
 ## Controls built in
@@ -21,7 +21,9 @@ A short warm-up task for getting participants used to an eye tracker (SCI 6384, 
 - Parametric shapes with equal area, positions counterbalanced
 - Keyboard responses, cursor hidden, 10 s timeout, 500 ms blank between trials
 - Sync patch in the bottom-left corner turns white while a stimulus is on screen (for aligning tracker recordings)
-- Pixel AOI coordinates for every shape are logged per trial
+- Pixel AOI coordinates for every shape are logged per trial; hybrids also log separate spiky and round AOIs
+- House sides (kiki left or right) are randomized per participant
+- Drag mode logs both grab time (decision) and drop time
 - `Esc` stops the session and still lets you save data
 
 ## Settings

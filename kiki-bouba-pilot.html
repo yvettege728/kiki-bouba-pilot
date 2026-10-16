@@ -13,7 +13,7 @@
   .card { max-width: 640px; padding: 32px; font-size: 20px; line-height: 1.55; }
   .card h1 { font-size: 32px; margin: 0 0 12px; }
   button { font-size: 18px; padding: 10px 20px; margin: 8px; border: 0; border-radius: 8px; background: #111; color: #fff; cursor: pointer; }
-  input { font-size: 18px; padding: 8px; width: 220px; border-radius: 6px; border: 1px solid #444; }
+  input, select { font-size: 18px; padding: 8px; width: 220px; border-radius: 6px; border: 1px solid #444; }
   kbd { background: #eee; border-radius: 4px; padding: 1px 7px; font-family: inherit; }
   .small { font-size: 15px; opacity: .75; }
 </style>
@@ -29,7 +29,12 @@ const CFG = {
   timeoutMs: 10000,    // max time per trial
   dotMs: 1500,         // time per follow-the-dot target
   practice: 2,
-  reps: { easy: 6, medium: 6, hard: 8 },
+  reps: { easy: 6, medium: 8 },
+  // Round 3 sorting: spikiness levels (0 = round, 1 = spiky) plus hybrid shapes
+  // that are half spiky, half round. Each entry is one trial.
+  sortLevels: [0, 0.15, 0.35, 0.5, 0.65, 0.85, 1],
+  sortHybrids: 3,
+  sortInput: 'keys',   // 'keys' (F/J, cleaner gaze data) or 'drag' (mouse); set on start screen
 };
 
 // ---------- Setup ----------
@@ -39,14 +44,16 @@ function resize() { W = cv.width = innerWidth; H = cv.height = innerHeight; }
 resize(); addEventListener('resize', resize);
 
 const log = [];
-let pid = '', t0 = 0, aborted = false;
+let pid = '', t0 = 0, aborted = false, kikiSide = 'left';
 const now = () => performance.now();
 function rec(o) {
   log.push(Object.assign({ pid, t_ms: +(now() - t0).toFixed(1), wall: new Date().toISOString() }, o));
   try { localStorage.setItem('kb_backup_' + pid, JSON.stringify(log)); } catch (e) {}
 }
 const rand = (a, b) => a + Math.random() * (b - a);
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
 const wait = ms => new Promise(r => setTimeout(r, ms));
+const frame = () => new Promise(requestAnimationFrame);
 function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 
 function clear() { ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, W, H); }
@@ -66,25 +73,34 @@ function text(s, x, y, size = 22) {
 // ---------- Parametric shapes ----------
 const TAU = Math.PI * 2, N = 720;
 function angDiff(a, b) { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
-function radial(fn) { const r = []; for (let i = 0; i < N; i++) r.push(fn(i / N * TAU)); return r; }
 
-// m = 0 is fully round (bouba), m = 1 is fully spiky (kiki)
-function morph(m, k, ph) {
-  return radial(t => {
-    const round = 1 + 0.12 * Math.sin(k * t + ph);
-    const p = (((k * t + ph) / TAU) % 1 + 1) % 1;
-    const spiky = 1 + 0.32 * (1 - 4 * Math.abs(p - 0.5));
-    return (1 - m) * round + m * spiky;
-  });
+// One generator for every shape.
+//   m       spikiness, 0 = round lobes (bouba), 1 = sharp spikes (kiki)
+//   k       number of lobes / spikes
+//   amp     how far features stick out
+//   jitter  per-feature amplitude variation (0 = perfectly regular)
+//   sector  optional {center, half}: spiky inside this arc, round outside (hybrid)
+// Returns radii plus the local spikiness at each angle (used for hybrid AOIs).
+function genShape(o) {
+  const amps = Array.from({ length: o.k }, () => 1 + o.jitter * rand(-1, 1));
+  const r = [], local = [];
+  for (let i = 0; i < N; i++) {
+    const t = i / N * TAU;
+    const u = (o.k * t + o.ph) / TAU, p = ((u % 1) + 1) % 1;
+    const j = ((Math.floor(u) % o.k) + o.k) % o.k;
+    let m = o.m;
+    if (o.sector) m = Math.min(1, Math.max(0, (o.sector.half - Math.abs(angDiff(t, o.sector.center))) / 0.3 + 0.5));
+    // Feature profile 1 - |x|^e: e = 3 gives blunt round lobes, e = 1 a plain
+    // triangle, e = 1/3 a needle-like spike. Round features also stick out less.
+    const e = Math.pow(3, 1 - 2 * m);
+    const f = 1 - Math.pow(Math.abs(2 * p - 1), e);
+    r.push(1 + o.amp * (0.55 + 0.6 * m) * amps[j] * f);
+    local.push(m);
+  }
+  return { r, local };
 }
-// Round blob with one local feature at featAng: a sharp spike (target) or a
-// smooth bump of the same height (distractor). Telling them apart needs foveal inspection.
-function blob(ph, k, featAng, sharp) {
-  return radial(t => {
-    const d = Math.abs(angDiff(t, featAng));
-    const f = sharp ? 0.38 * Math.max(0, 1 - d / 0.13) : 0.38 * Math.exp(-((d / 0.17) ** 2));
-    return 1 + 0.08 * Math.sin(k * t + ph) + f;
-  });
+function randomParams(m) {
+  return { m, k: randInt(4, 10), amp: rand(0.3, 0.55), jitter: rand(0, 0.35), ph: rand(0, TAU) };
 }
 // Scale so every shape has the same area (equivalent radius = size px)
 function toPts(r, cx, cy, size) {
@@ -92,11 +108,12 @@ function toPts(r, cx, cy, size) {
   const s = size / Math.sqrt(a / Math.PI);
   return r.map((x, i) => [cx + Math.cos(i / N * TAU) * x * s, cy + Math.sin(i / N * TAU) * x * s]);
 }
-function drawShape(pts) {
-  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+function drawShape(pts, dx = 0, dy = 0) {
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0] + dx, p[1] + dy) : ctx.moveTo(p[0] + dx, p[1] + dy));
   ctx.closePath(); ctx.fillStyle = '#111'; ctx.fill();
 }
 function bbox(pts) {
+  if (!pts.length) return null;
   let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
   for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
   return [Math.round(x0), Math.round(y0), Math.round(x1 - x0), Math.round(y1 - y0)];
@@ -137,63 +154,55 @@ async function followDot() {
       clear(); sync(true);
       ctx.fillStyle = '#c00'; ctx.beginPath(); ctx.arc(x, y, 18 - 12 * p, 0, TAU); ctx.fill();
       ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, 3, 0, TAU); ctx.fill();
-      await new Promise(requestAnimationFrame);
+      await frame();
     }
     rec({ event: 'dot_off', trial: i, block: 'dot' });
   }
   clear(); sync(false);
 }
 
-// ---------- Phase 2: kiki/bouba trials ----------
+// ---------- Rounds 1-2: which one is kiki? ----------
 function makeBlock(block, n) {
-  const nPos = block === 'hard' ? 4 : 2;
   const T = [];
-  for (let i = 0; i < n; i++) T.push({ block, targetPos: i % nPos }); // counterbalanced positions
+  for (let i = 0; i < n; i++) T.push({ block, targetPos: i % 2 }); // counterbalanced positions
   return shuffle(T);
 }
 
-async function runTrial(tr, idx) {
+async function runChoiceTrial(tr, idx) {
   resize();
   clear(); sync(false); cross();
   rec({ event: 'fixation', trial: idx, block: tr.block });
   await wait(CFG.fixMs);
 
-  const n = tr.block === 'hard' ? 4 : 2;
-  const keys = n === 4 ? ['d', 'f', 'j', 'k'] : ['f', 'j'];
-  const size = Math.min(W / (n + 1) * 0.36, H * 0.2);
-  const cy = H / 2;
+  const keys = ['f', 'j'];
+  const size = Math.min(W / 3 * 0.36, H * 0.2), cy = H / 2;
   const shapes = [];
   clear();
-  for (let i = 0; i < n; i++) {
-    const cx = W * (i + 1) / (n + 1);
-    const isT = i === tr.targetPos, ph = rand(0, TAU);
-    let r, aoi;
-    if (tr.block === 'hard') {
-      const fa = rand(0, TAU);
-      r = blob(ph, 5, fa, isT);
-      const pts = toPts(r, cx, cy, size);
-      const tip = pts[Math.round(fa / TAU * N) % N], a = size * 0.35;
-      aoi = [Math.round(tip[0] - a), Math.round(tip[1] - a), Math.round(2 * a), Math.round(2 * a)];
-      drawShape(pts);
-      shapes.push({ pos: i, target: isT, feature: isT ? 'spike' : 'bump', cx: Math.round(cx), cy: Math.round(cy), bbox: bbox(pts), aoi });
+  for (let i = 0; i < 2; i++) {
+    const cx = W * (i + 1) / 3, isT = i === tr.targetPos;
+    let p;
+    if (tr.block === 'medium') {
+      // Varied kikis and boubas: different spike counts, sizes, irregularity, rotation
+      p = randomParams(isT ? rand(0.6, 0.8) : rand(0.2, 0.4));
     } else {
-      const m = tr.block === 'medium' ? (isT ? 0.65 : 0.35) : (isT ? 1 : 0);
-      const pts = toPts(morph(m, 8, ph), cx, cy, size);
-      drawShape(pts);
-      const b = bbox(pts);
-      shapes.push({ pos: i, target: isT, spikiness: m, cx: Math.round(cx), cy: Math.round(cy), bbox: b, aoi: b });
+      p = { m: isT ? 1 : 0, k: 8, amp: 0.45, jitter: 0, ph: rand(0, TAU) };
     }
+    const pts = toPts(genShape(p).r, cx, cy, size);
+    drawShape(pts);
+    const b = bbox(pts);
+    shapes.push({ pos: i, target: isT, m: +p.m.toFixed(2), k: p.k, amp: +p.amp.toFixed(2), jitter: +p.jitter.toFixed(2),
+                  cx: Math.round(cx), cy: Math.round(cy), bbox: b, aoi: b });
     text(keys[i].toUpperCase(), cx, cy + size * 1.9, 20);
   }
   text('Which one is KIKI?', W / 2, H * 0.12, 26);
   sync(true);
   const onset = now();
-  rec({ event: 'stim_on', trial: idx, block: tr.block, n, target_pos: tr.targetPos, stim: JSON.stringify(shapes) });
+  rec({ event: 'stim_on', trial: idx, block: tr.block, n: 2, target_pos: tr.targetPos, stim: JSON.stringify(shapes) });
 
   const resp = await waitKey(keys, CFG.timeoutMs);
   const rp = resp.key ? keys.indexOf(resp.key) : -1;
   const correct = rp === tr.targetPos;
-  rec({ event: 'response', trial: idx, block: tr.block, n, target_pos: tr.targetPos,
+  rec({ event: 'response', trial: idx, block: tr.block, n: 2, target_pos: tr.targetPos,
         key: resp.key || 'timeout', resp_pos: rp, correct: correct ? 1 : 0, rt_ms: +(resp.t - onset).toFixed(1) });
 
   clear(); sync(false);
@@ -202,10 +211,107 @@ async function runTrial(tr, idx) {
   return { correct, rt: resp.t - onset, timeout: !resp.key };
 }
 
+// ---------- Round 3: sort one shape into the kiki house or the bouba house ----------
+function makeSortBlock() {
+  const T = CFG.sortLevels.map(m => ({ block: 'sort', m, hybrid: false }));
+  for (let i = 0; i < CFG.sortHybrids; i++) T.push({ block: 'sort', m: 0.5, hybrid: true });
+  return shuffle(T);
+}
+function houses() {
+  const s = Math.min(W * 0.09, H * 0.16), y = H / 2;
+  const L = { x: W * 0.13, y, s }, R = { x: W * 0.87, y, s };
+  L.label = kikiSide === 'left' ? 'KIKI' : 'BOUBA';
+  R.label = kikiSide === 'left' ? 'BOUBA' : 'KIKI';
+  for (const h of [L, R]) h.rect = [Math.round(h.x - h.s), Math.round(h.y - h.s), Math.round(2 * h.s), Math.round(2 * h.s)];
+  return { left: L, right: R };
+}
+function drawHouse(h) {
+  const { x, y, s } = h;
+  ctx.fillStyle = '#d6d6d6'; ctx.beginPath();
+  ctx.moveTo(x - s, y - s * 0.2); ctx.lineTo(x, y - s); ctx.lineTo(x + s, y - s * 0.2);
+  ctx.lineTo(x + s, y + s); ctx.lineTo(x - s, y + s); ctx.closePath(); ctx.fill();
+  text(h.label, x, y + s * 0.35, Math.round(s * 0.28));
+}
+const inRect = (x, y, r) => x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3];
+
+function dragResponse(pts, hs, draw, timeout) {
+  return new Promise(res => {
+    let done = false, dragging = false, grabT = null, sx = 0, sy = 0, dx = 0, dy = 0;
+    const b = bbox(pts);
+    const down = e => { if (inRect(e.clientX, e.clientY, b)) { dragging = true; sx = e.clientX; sy = e.clientY; if (grabT === null) grabT = now(); } };
+    const move = e => { if (!dragging) return; dx = e.clientX - sx; dy = e.clientY - sy; draw(dx, dy); };
+    const up = e => {
+      if (!dragging) return; dragging = false;
+      const side = inRect(e.clientX, e.clientY, hs.left.rect) ? 'left' : inRect(e.clientX, e.clientY, hs.right.rect) ? 'right' : null;
+      if (side) finish(side); else { dx = dy = 0; draw(0, 0); }
+    };
+    const key = e => { if (e.key === 'Escape') { aborted = true; finish(null); } };
+    const to = setTimeout(() => finish(null), timeout);
+    function finish(side) {
+      if (done) return; done = true; clearTimeout(to);
+      cv.removeEventListener('mousedown', down); removeEventListener('mousemove', move);
+      removeEventListener('mouseup', up); removeEventListener('keydown', key);
+      res({ side, t: now(), grabT });
+    }
+    cv.addEventListener('mousedown', down); addEventListener('mousemove', move);
+    addEventListener('mouseup', up); addEventListener('keydown', key);
+  });
+}
+
+async function runSortTrial(tr, idx) {
+  resize();
+  const hs = houses();
+  clear(); sync(false); drawHouse(hs.left); drawHouse(hs.right); cross();
+  rec({ event: 'fixation', trial: idx, block: 'sort' });
+  await wait(CFG.fixMs);
+
+  const p = randomParams(tr.m);
+  if (tr.hybrid) p.sector = { center: rand(0, TAU), half: Math.PI / 2 };   // half spiky, half round
+  const g = genShape(p);
+  const size = Math.min(W * 0.11, H * 0.17);
+  const pts = toPts(g.r, W / 2, H / 2, size);
+  const draw = (dx, dy) => { clear(); drawHouse(hs.left); drawHouse(hs.right); drawShape(pts, dx, dy); sync(true); };
+  draw(0, 0);
+
+  const stim = { m: tr.m, hybrid: tr.hybrid, k: p.k, amp: +p.amp.toFixed(2), jitter: +p.jitter.toFixed(2),
+    kiki_side: kikiSide, bbox: bbox(pts), house_left: hs.left.rect, house_right: hs.right.rect };
+  if (tr.hybrid) {
+    stim.aoi_spiky = bbox(pts.filter((_, i) => g.local[i] > 0.5));
+    stim.aoi_round = bbox(pts.filter((_, i) => g.local[i] <= 0.5));
+  }
+  const onset = now();
+  rec({ event: 'stim_on', trial: idx, block: 'sort', stim: JSON.stringify(stim) });
+
+  let side, t, grabT = null;
+  if (CFG.sortInput === 'drag') {
+    document.body.classList.remove('running');
+    ({ side, t, grabT } = await dragResponse(pts, hs, draw, CFG.timeoutMs));
+    document.body.classList.add('running');
+  } else {
+    const r = await waitKey(['f', 'j'], CFG.timeoutMs);
+    side = r.key === 'f' ? 'left' : r.key === 'j' ? 'right' : null; t = r.t;
+    if (side) {  // slide the shape into the chosen house
+      const tx = hs[side].x - W / 2, a0 = now();
+      while (now() - a0 < 300) { const q = (now() - a0) / 300; draw(tx * q, 0); await frame(); }
+    }
+  }
+  const choice = side ? hs[side].label.toLowerCase() : 'timeout';
+  // "correct" only exists for clear-cut shapes; ambiguous ones have no right answer
+  const expected = tr.hybrid || (tr.m > 0.15 && tr.m < 0.85) ? null : tr.m >= 0.85 ? 'kiki' : 'bouba';
+  const correct = expected && side ? (choice === expected ? 1 : 0) : null;
+  rec({ event: 'response', trial: idx, block: 'sort', key: side || 'timeout', choice, correct,
+        rt_ms: +(t - onset).toFixed(1), grab_ms: grabT ? +(grabT - onset).toFixed(1) : null,
+        stim: JSON.stringify({ m: tr.m, hybrid: tr.hybrid }) });
+
+  clear(); sync(false);
+  await wait(CFG.blankMs);
+  return { correct, choice, m: tr.m, hybrid: tr.hybrid, rt: t - onset, timeout: !side };
+}
+
 // ---------- Flow ----------
 async function main() {
   t0 = now();
-  rec({ event: 'session_start', stim: JSON.stringify({ W, H, dpr: devicePixelRatio, ua: navigator.userAgent }) });
+  rec({ event: 'session_start', stim: JSON.stringify({ W, H, dpr: devicePixelRatio, ua: navigator.userAgent, kiki_side: kikiSide, sort_input: CFG.sortInput }) });
 
   await screen(`<h1>Warm-up</h1>A red dot will jump around the screen.<br>Just <b>follow it with your eyes</b>. Keep your head still.`);
   await followDot();
@@ -214,8 +320,10 @@ async function main() {
     ['practice', makeBlock('easy', CFG.practice).map(t => ({ ...t, block: 'practice' })),
       `<h1>Kiki or Bouba?</h1>One of these shapes is called <b>kiki</b>, the other <b>bouba</b>.<br>Find <b>kiki</b> and press the key under it.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.<br>Look at the <b>cross</b> whenever it appears.<br><br>First, two practice rounds.`],
     ['easy', makeBlock('easy', CFG.reps.easy), `<h1>Round 1</h1>Same task. No more feedback from here on.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.`],
-    ['medium', makeBlock('medium', CFG.reps.medium), `<h1>Round 2</h1>The shapes get harder to tell apart.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.`],
-    ['hard', makeBlock('hard', CFG.reps.hard), `<h1>Round 3</h1>Now four shapes. Only <b>one</b> has a sharp point.<br>Find it and press <kbd>D</kbd> <kbd>F</kbd> <kbd>J</kbd> or <kbd>K</kbd>.`],
+    ['medium', makeBlock('medium', CFG.reps.medium), `<h1>Round 2</h1>The shapes come in many forms now.<br>Still find <b>kiki</b>.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.`],
+    ['sort', makeSortBlock(), CFG.sortInput === 'drag'
+      ? `<h1>Round 3</h1>One shape at a time. Is it a kiki or a bouba?<br><b>Drag it</b> into the right house with the mouse.<br>There is no wrong answer for the strange ones. Go with your gut.`
+      : `<h1>Round 3</h1>One shape at a time. Is it a kiki or a bouba?<br>Send it home: <kbd>F</kbd> = left house, <kbd>J</kbd> = right house.<br>There is no wrong answer for the strange ones. Go with your gut.`],
   ];
   const results = [];
   let idx = 0;
@@ -223,7 +331,11 @@ async function main() {
     if (aborted) break;
     await screen(intro);
     rec({ event: 'block_start', block: name });
-    for (const tr of trials) { if (aborted) break; const r = await runTrial(tr, idx++); if (name !== 'practice') results.push({ ...r, block: name }); }
+    for (const tr of trials) {
+      if (aborted) break;
+      const r = name === 'sort' ? await runSortTrial(tr, idx++) : await runChoiceTrial(tr, idx++);
+      if (name !== 'practice') results.push({ ...r, block: name });
+    }
   }
   rec({ event: aborted ? 'session_aborted' : 'session_end' });
   end(results);
@@ -231,14 +343,19 @@ async function main() {
 
 function end(results) {
   document.body.classList.remove('running'); clear();
-  const by = b => results.filter(r => r.block === b && !r.timeout);
-  const row = b => { const r = by(b); if (!r.length) return `<tr><td>${b}</td><td colspan=2>no data</td></tr>`;
-    const acc = Math.round(100 * r.filter(x => x.correct).length / r.length);
-    const rt = Math.round(r.reduce((s, x) => s + x.rt, 0) / r.length);
-    return `<tr><td>${b}</td><td>${acc}%</td><td>${rt} ms</td></tr>`; };
+  const ok = b => results.filter(r => r.block === b && !r.timeout);
+  const mean = a => a.length ? Math.round(a.reduce((s, x) => s + x, 0) / a.length) : '-';
+  const row = (label, r) => {
+    const scored = r.filter(x => x.correct !== null);
+    const acc = scored.length ? Math.round(100 * scored.filter(x => x.correct).length / scored.length) + '%' : '-';
+    return `<tr><td>${label}</td><td>${acc}</td><td>${mean(r.map(x => x.rt))} ms</td></tr>`;
+  };
+  const sort = ok('sort'), amb = sort.filter(x => x.correct === null);
+  const ambKiki = amb.length ? Math.round(100 * amb.filter(x => x.choice === 'kiki').length / amb.length) + '%' : '-';
   ui.innerHTML = `<div class="card"><h1>${aborted ? 'Stopped' : 'Done, thank you!'}</h1>
-    <table style="margin:0 auto 16px;border-spacing:18px 4px"><tr><th>Round</th><th>Accuracy</th><th>Mean RT</th></tr>
-    ${row('easy')}${row('medium')}${row('hard')}</table>
+    <table style="margin:0 auto 8px;border-spacing:18px 4px"><tr><th>Round</th><th>Accuracy</th><th>Mean RT</th></tr>
+    ${row('1 easy', ok('easy'))}${row('2 varied', ok('medium'))}${row('3 sort (clear shapes)', sort.filter(x => x.correct !== null))}
+    <tr><td>3 sort (ambiguous)</td><td>${ambKiki} kiki</td><td>${mean(amb.map(x => x.rt))} ms</td></tr></table>
     <button id="csv">Download CSV</button><button id="json">Download JSON</button>
     <p class="small">Data is also backed up in this browser under key kb_backup_${pid}.</p></div>`;
   document.getElementById('csv').onclick = () => download('csv');
@@ -246,7 +363,7 @@ function end(results) {
 }
 
 function download(kind) {
-  const cols = ['pid', 't_ms', 'wall', 'event', 'trial', 'block', 'n', 'target_pos', 'key', 'resp_pos', 'correct', 'rt_ms', 'stim'];
+  const cols = ['pid', 't_ms', 'wall', 'event', 'trial', 'block', 'n', 'target_pos', 'key', 'resp_pos', 'choice', 'correct', 'rt_ms', 'grab_ms', 'stim'];
   const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v;
   const body = kind === 'csv'
     ? [cols.join(','), ...log.map(r => cols.map(c => esc(r[c])).join(','))].join('\n')
@@ -262,10 +379,14 @@ clear();
 ui.innerHTML = `<div class="card"><h1>Kiki / Bouba eye-tracking pilot</h1>
   <p>Run calibration in the tracker software first.<br>Sit about 60 cm from the screen.</p>
   <p><input id="pid" placeholder="Participant ID (e.g. P01)"></p>
+  <p class="small">Round 3 input:
+    <select id="mode" style="width:auto"><option value="keys">Keys F / J (recommended)</option><option value="drag">Mouse drag</option></select></p>
   <button id="go">Start (full screen)</button>
   <p class="small"><kbd>Esc</kbd> at any time stops the session and still lets you save data.</p></div>`;
 document.getElementById('go').onclick = async () => {
   pid = document.getElementById('pid').value.trim() || 'anon';
+  CFG.sortInput = document.getElementById('mode').value;
+  kikiSide = Math.random() < 0.5 ? 'left' : 'right';   // counterbalance house sides across participants
   try { await document.documentElement.requestFullscreen(); } catch (e) {}
   await wait(400); resize(); ui.innerHTML = ''; main();
 };
