@@ -34,7 +34,6 @@ const CFG = {
   // that are half spiky, half round. Each entry is one trial.
   sortLevels: [0, 0.15, 0.35, 0.5, 0.65, 0.85, 1],
   sortHybrids: 3,
-  sortInput: 'keys',   // 'keys' (F/J, cleaner gaze data) or 'drag' (mouse); set on start screen
 };
 
 // ---------- Setup ----------
@@ -234,30 +233,6 @@ function drawHouse(h) {
 }
 const inRect = (x, y, r) => x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3];
 
-function dragResponse(pts, hs, draw, timeout) {
-  return new Promise(res => {
-    let done = false, dragging = false, grabT = null, sx = 0, sy = 0, dx = 0, dy = 0;
-    const b = bbox(pts);
-    const down = e => { if (inRect(e.clientX, e.clientY, b)) { dragging = true; sx = e.clientX; sy = e.clientY; if (grabT === null) grabT = now(); } };
-    const move = e => { if (!dragging) return; dx = e.clientX - sx; dy = e.clientY - sy; draw(dx, dy); };
-    const up = e => {
-      if (!dragging) return; dragging = false;
-      const side = inRect(e.clientX, e.clientY, hs.left.rect) ? 'left' : inRect(e.clientX, e.clientY, hs.right.rect) ? 'right' : null;
-      if (side) finish(side); else { dx = dy = 0; draw(0, 0); }
-    };
-    const key = e => { if (e.key === 'Escape') { aborted = true; finish(null); } };
-    const to = setTimeout(() => finish(null), timeout);
-    function finish(side) {
-      if (done) return; done = true; clearTimeout(to);
-      cv.removeEventListener('mousedown', down); removeEventListener('mousemove', move);
-      removeEventListener('mouseup', up); removeEventListener('keydown', key);
-      res({ side, t: now(), grabT });
-    }
-    cv.addEventListener('mousedown', down); addEventListener('mousemove', move);
-    addEventListener('mouseup', up); addEventListener('keydown', key);
-  });
-}
-
 async function runSortTrial(tr, idx) {
   resize();
   const hs = houses();
@@ -282,25 +257,18 @@ async function runSortTrial(tr, idx) {
   const onset = now();
   rec({ event: 'stim_on', trial: idx, block: 'sort', stim: JSON.stringify(stim) });
 
-  let side, t, grabT = null;
-  if (CFG.sortInput === 'drag') {
-    document.body.classList.remove('running');
-    ({ side, t, grabT } = await dragResponse(pts, hs, draw, CFG.timeoutMs));
-    document.body.classList.add('running');
-  } else {
-    const r = await waitKey(['f', 'j'], CFG.timeoutMs);
-    side = r.key === 'f' ? 'left' : r.key === 'j' ? 'right' : null; t = r.t;
-    if (side) {  // slide the shape into the chosen house
-      const tx = hs[side].x - W / 2, a0 = now();
-      while (now() - a0 < 300) { const q = (now() - a0) / 300; draw(tx * q, 0); await frame(); }
-    }
+  const r = await waitKey(['f', 'j'], CFG.timeoutMs);
+  const side = r.key === 'f' ? 'left' : r.key === 'j' ? 'right' : null, t = r.t;
+  if (side) {  // slide the shape into the chosen house
+    const tx = hs[side].x - W / 2, a0 = now();
+    while (now() - a0 < 300) { const q = (now() - a0) / 300; draw(tx * q, 0); await frame(); }
   }
   const choice = side ? hs[side].label.toLowerCase() : 'timeout';
   // "correct" only exists for clear-cut shapes; ambiguous ones have no right answer
   const expected = tr.hybrid || (tr.m > 0.15 && tr.m < 0.85) ? null : tr.m >= 0.85 ? 'kiki' : 'bouba';
   const correct = expected && side ? (choice === expected ? 1 : 0) : null;
   rec({ event: 'response', trial: idx, block: 'sort', key: side || 'timeout', choice, correct,
-        rt_ms: +(t - onset).toFixed(1), grab_ms: grabT ? +(grabT - onset).toFixed(1) : null,
+        rt_ms: +(t - onset).toFixed(1),
         stim: JSON.stringify({ m: tr.m, hybrid: tr.hybrid }) });
 
   clear(); sync(false);
@@ -311,7 +279,7 @@ async function runSortTrial(tr, idx) {
 // ---------- Flow ----------
 async function main() {
   t0 = now();
-  rec({ event: 'session_start', stim: JSON.stringify({ W, H, dpr: devicePixelRatio, ua: navigator.userAgent, kiki_side: kikiSide, sort_input: CFG.sortInput }) });
+  rec({ event: 'session_start', stim: JSON.stringify({ W, H, dpr: devicePixelRatio, ua: navigator.userAgent, kiki_side: kikiSide }) });
 
   await screen(`<h1>Warm-up</h1>A red dot will jump around the screen.<br>Just <b>follow it with your eyes</b>. Keep your head still.`);
   await followDot();
@@ -321,9 +289,7 @@ async function main() {
       `<h1>Kiki or Bouba?</h1>One of these shapes is called <b>kiki</b>, the other <b>bouba</b>.<br>Find <b>kiki</b> and press the key under it.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.<br>Look at the <b>cross</b> whenever it appears.<br><br>First, two practice rounds.`],
     ['easy', makeBlock('easy', CFG.reps.easy), `<h1>Round 1</h1>Same task. No more feedback from here on.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.`],
     ['medium', makeBlock('medium', CFG.reps.medium), `<h1>Round 2</h1>The shapes come in many forms now.<br>Still find <b>kiki</b>.<br><kbd>F</kbd> = left, <kbd>J</kbd> = right.`],
-    ['sort', makeSortBlock(), CFG.sortInput === 'drag'
-      ? `<h1>Round 3</h1>One shape at a time. Is it a kiki or a bouba?<br><b>Drag it</b> into the right house with the mouse.<br>There is no wrong answer for the strange ones. Go with your gut.`
-      : `<h1>Round 3</h1>One shape at a time. Is it a kiki or a bouba?<br>Send it home: <kbd>F</kbd> = left house, <kbd>J</kbd> = right house.<br>There is no wrong answer for the strange ones. Go with your gut.`],
+    ['sort', makeSortBlock(), `<h1>Round 3</h1>One shape at a time. Is it a kiki or a bouba?<br>Send it home: <kbd>F</kbd> = left house, <kbd>J</kbd> = right house.<br>There is no wrong answer for the strange ones. Go with your gut.`],
   ];
   const results = [];
   let idx = 0;
@@ -363,7 +329,7 @@ function end(results) {
 }
 
 function download(kind) {
-  const cols = ['pid', 't_ms', 'wall', 'event', 'trial', 'block', 'n', 'target_pos', 'key', 'resp_pos', 'choice', 'correct', 'rt_ms', 'grab_ms', 'stim'];
+  const cols = ['pid', 't_ms', 'wall', 'event', 'trial', 'block', 'n', 'target_pos', 'key', 'resp_pos', 'choice', 'correct', 'rt_ms', 'stim'];
   const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v;
   const body = kind === 'csv'
     ? [cols.join(','), ...log.map(r => cols.map(c => esc(r[c])).join(','))].join('\n')
@@ -379,13 +345,10 @@ clear();
 ui.innerHTML = `<div class="card"><h1>Kiki / Bouba eye-tracking pilot</h1>
   <p>Run calibration in the tracker software first.<br>Sit about 60 cm from the screen.</p>
   <p><input id="pid" placeholder="Participant ID (e.g. P01)"></p>
-  <p class="small">Round 3 input:
-    <select id="mode" style="width:auto"><option value="keys">Keys F / J (recommended)</option><option value="drag">Mouse drag</option></select></p>
   <button id="go">Start (full screen)</button>
   <p class="small"><kbd>Esc</kbd> at any time stops the session and still lets you save data.</p></div>`;
 document.getElementById('go').onclick = async () => {
   pid = document.getElementById('pid').value.trim() || 'anon';
-  CFG.sortInput = document.getElementById('mode').value;
   kikiSide = Math.random() < 0.5 ? 'left' : 'right';   // counterbalance house sides across participants
   try { await document.documentElement.requestFullscreen(); } catch (e) {}
   await wait(400); resize(); ui.innerHTML = ''; main();
