@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gaze Aligner</title>
+<style>
+  :root { --bg: #f6f5f2; --card: #fff; --ink: #1d1d1b; --muted: #6b6a66; --line: #dddbd4; --accent: #2f5d8a; --bad: #a33; --ok: #2d6a3e; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1b1b1a; --card: #252524; --ink: #ecebe6; --muted: #a3a29c; --line: #3a3936; --accent: #7fb0e0; --bad: #e88; --ok: #8c8; } }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 -apple-system, Helvetica, Arial, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 24px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 17px; font-weight: 600; margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-top: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 20px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 3px; }
+  select, input[type=number], input[type=text] { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+  .drop { border: 1.5px dashed var(--line); border-radius: 10px; padding: 18px; text-align: center; cursor: pointer; }
+  .drop.done { border-style: solid; border-color: var(--ok); }
+  button { font: inherit; padding: 8px 16px; border: 0; border-radius: 7px; background: var(--accent); color: #fff; cursor: pointer; margin: 4px 8px 4px 0; }
+  button:disabled { opacity: .4; cursor: default; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .scroll { overflow-x: auto; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  canvas { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: #808080; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Gaze aligner</h1>
+  <p class="muted">Lines up an eye-tracker export with a kiki/bouba game log and computes per-trial gaze metrics. Everything runs in this browser; no data is uploaded.</p>
+
+  <div class="card grid">
+    <div><h2>1. Game log</h2><div class="drop" id="dropGame">Drop the game CSV or JSON here, or click</div><input type="file" id="fileGame" accept=".csv,.json,.txt" hidden></div>
+    <div><h2>2. Eye-tracker export</h2><div class="drop" id="dropGaze">Drop the gaze CSV / TSV here, or click</div><input type="file" id="fileGaze" accept=".csv,.tsv,.txt" hidden></div>
+  </div>
+
+  <div class="card" id="settings" hidden>
+    <h2>3. Check the detected settings</h2>
+    <div class="grid">
+      <div><label>Timestamp column</label><select id="colT"></select></div>
+      <div><label>Gaze X column</label><select id="colX"></select></div>
+      <div><label>Gaze Y column</label><select id="colY"></select></div>
+      <div><label>Timestamp unit</label><select id="unit"><option value="1000">seconds</option><option value="1">milliseconds</option><option value="0.001">microseconds</option><option value="0.000001">nanoseconds</option></select></div>
+      <div><label>Gaze coordinates</label><select id="coord"><option value="norm">Normalized 0 to 1</option><option value="px">Pixels</option></select></div>
+      <div><label>Flip Y (origin at bottom, e.g. Pupil Labs)</label><select id="flipY"><option value="0">No</option><option value="1">Yes</option></select></div>
+      <div><label>Tracker pixels per game pixel (pixel mode only)</label><input type="number" id="scale" step="0.01" value="1"></div>
+      <div><label>Fixation dispersion threshold (game px)</label><input type="number" id="thr" value="40"></div>
+      <div><label>Minimum fixation duration (ms)</label><input type="number" id="minDur" value="80"></div>
+      <div><label>AOI margin (game px)</label><input type="number" id="margin" value="30"></div>
+      <div><label>Time offset override (ms, leave empty for automatic)</label><input type="text" id="offsetOverride" placeholder="automatic"></div>
+    </div>
+    <p><button id="run">Align and compute</button></p>
+  </div>
+
+  <div class="card" id="syncCard" hidden>
+    <h2>4. Sync check (follow-the-dot)</h2>
+    <p id="syncText"></p>
+    <canvas id="dotCanvas" width="960" height="540"></canvas>
+    <p class="muted">Red rings are the dot targets. Small dots are aligned gaze during each target, one colour per target. Each cluster should sit on its ring.</p>
+    <div class="scroll"><table id="dotTable"></table></div>
+  </div>
+
+  <div class="card" id="resCard" hidden>
+    <h2>5. Per-trial metrics</h2>
+    <p><button id="dlTrials">Download trial metrics CSV</button><button id="dlSamples">Download aligned samples CSV</button></p>
+    <div class="scroll"><table id="resTable"></table></div>
+    <p class="muted">ttff = time to first fixation from stimulus onset (ms). dwell = total fixation time (ms) before the response. Regions: target / other (rounds 1 and 2), spiky / round half of hybrid shapes, shape, and the two houses (round 3).</p>
+  </div>
+</main>
+<script>
+// ---------- CSV ----------
+function parseDelimited(text) {
+  const first = text.split(/\r?\n/, 1)[0];
+  const delim = [',', '\t', ';'].map(d => [d, first.split(d).length]).sort((a, b) => b[1] - a[1])[0][0];
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+    else if (c === '"') q = true;
+    else if (c === delim) { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  const head = rows.shift().map(h => h.trim());
+  return { head, rows: rows.filter(r => r.length > 1 || r[0] !== '') };
+}
+function toCSV(cols, objs) {
+  const esc = v => v == null || (typeof v === 'number' && isNaN(v)) ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v;
+  return [cols.join(','), ...objs.map(o => cols.map(c => esc(o[c])).join(','))].join('\n');
+}
+function download(name, text) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' })); a.download = name; a.click();
+}
+
+// ---------- Loading ----------
+let game = null, gazeTable = null, result = null;
+const $ = id => document.getElementById(id);
+
+function loadGame(text) {
+  let recs;
+  if (text.trim().startsWith('[')) recs = JSON.parse(text);
+  else { const t = parseDelimited(text); recs = t.rows.map(r => Object.fromEntries(t.head.map((h, i) => [h, r[i]]))); }
+  for (const r of recs) { r.t_ms = +r.t_ms; if (typeof r.stim === 'string' && r.stim) { try { r.stim = JSON.parse(r.stim); } catch (e) {} } }
+  const start = recs.find(r => r.event === 'session_start');
+  game = { recs, pid: recs[0]?.pid || 'unknown', W: start?.stim?.W || 1920, H: start?.stim?.H || 1080, dpr: start?.stim?.dpr || 1 };
+}
+function loadGaze(text) {
+  gazeTable = parseDelimited(text);
+  const h = gazeTable.head, pick = re => h.find(c => re.test(c)) || h[0];
+  const tCol = pick(/recording timestamp|gaze_timestamp|^timestamp|time_?stamp|^time$|^time\b/i);
+  const xCol = pick(/gaze point x(?!.*mcs)|bpogx|norm_pos_x|gaze_?x|^x$|point.?x/i);
+  const yCol = pick(/gaze point y(?!.*mcs)|bpogy|norm_pos_y|gaze_?y|^y$|point.?y/i);
+  for (const [id, sel] of [['colT', tCol], ['colX', xCol], ['colY', yCol]])
+    $(id).innerHTML = h.map(c => `<option${c === sel ? ' selected' : ''}>${c}</option>`).join('');
+  guessUnits();
+  $('flipY').value = /norm_pos/i.test(yCol) ? '1' : '0';
+}
+function column(name) { const i = gazeTable.head.indexOf(name); return gazeTable.rows.map(r => parseFloat(r[i])); }
+function guessUnits() {
+  const T = column($('colT').value).filter(isFinite), X = column($('colX').value).filter(isFinite);
+  const d = []; for (let i = 1; i < Math.min(T.length, 2000); i++) if (T[i] > T[i - 1]) d.push(T[i] - T[i - 1]);
+  d.sort((a, b) => a - b); const md = d[Math.floor(d.length / 2)] || 1;
+  $('unit').value = md < 0.1 ? '1000' : md < 100 ? '1' : md < 100000 ? '0.001' : '0.000001';
+  const maxX = Math.max(...X.slice(0, 5000).map(Math.abs));
+  $('coord').value = maxX <= 1.5 ? 'norm' : 'px';
+  if (game) $('scale').value = maxX > game.W * 1.25 ? game.dpr : 1;
+}
+['colT', 'colX', 'colY'].forEach(id => $(id).addEventListener('change', guessUnits));
+
+function hookDrop(dropId, fileId, onText) {
+  const d = $(dropId), f = $(fileId);
+  const take = file => file.text().then(t => { onText(t); d.textContent = file.name; d.classList.add('done'); refresh(); });
+  d.onclick = () => f.click();
+  f.onchange = () => f.files[0] && take(f.files[0]);
+  d.ondragover = e => { e.preventDefault(); };
+  d.ondrop = e => { e.preventDefault(); e.dataTransfer.files[0] && take(e.dataTransfer.files[0]); };
+}
+hookDrop('dropGame', 'fileGame', loadGame);
+hookDrop('dropGaze', 'fileGaze', loadGaze);
+function refresh() { if (game && gazeTable) { $('settings').hidden = false; guessUnits(); } }
+
+// ---------- Alignment ----------
+// Gaze samples in game pixels and tracker milliseconds
+function gazeSamples() {
+  const T = column($('colT').value), X = column($('colX').value), Y = column($('colY').value);
+  const u = +$('unit').value, norm = $('coord').value === 'norm', flip = $('flipY').value === '1', sc = +$('scale').value || 1;
+  const S = [];
+  for (let i = 0; i < T.length; i++) {
+    if (!isFinite(T[i]) || !isFinite(X[i]) || !isFinite(Y[i])) continue;
+    let x = X[i], y = flip ? (norm ? 1 - Y[i] : -Y[i]) : Y[i];
+    if (norm) { x *= game.W; y *= game.H; } else { x /= sc; y /= sc; }
+    S.push({ T: T[i] * u, x, y });
+  }
+  S.sort((a, b) => a.T - b.T);
+  return S;
+}
+function lowerBound(S, t) { let lo = 0, hi = S.length; while (lo < hi) { const m = (lo + hi) >> 1; if (S[m].T < t) lo = m + 1; else hi = m; } return lo; }
+
+function dotWindows() {
+  const on = game.recs.filter(r => r.event === 'dot_on'), off = game.recs.filter(r => r.event === 'dot_off');
+  // Windows are shifted by a typical saccade latency (200 ms): the eyes reach a new dot about 200 ms after it appears
+  return on.map(r => { const o = off.find(f => +f.trial === +r.trial); return { x: r.stim.x, y: r.stim.y, g0: r.t_ms + 200, g1: (o ? o.t_ms : r.t_ms + 1500) + 200 }; });
+}
+// Cost of an offset: mean distance (capped) between gaze and the dot it should be on
+function cost(S, dots, o) {
+  let total = 0;
+  for (const d of dots) {
+    let i = lowerBound(S, d.g0 + o), n = 0, s = 0;
+    for (; i < S.length && S[i].T <= d.g1 + o; i++) { s += Math.min(400, Math.hypot(S[i].x - d.x, S[i].y - d.y)); n++; }
+    total += n >= 3 ? s / n : 400;
+  }
+  return total / dots.length;
+}
+function findOffset(S, dots) {
+  const lo = S[0].T - dots[0].g0, hi = S[S.length - 1].T - dots[dots.length - 1].g1;
+  let best = lo, bestC = Infinity;
+  const step = Math.max(10, (hi - lo) / 200000);
+  for (let o = lo; o <= hi; o += step) { const c = cost(S, dots, o); if (c < bestC) { bestC = c; best = o; } }
+  // Refine at 1 ms, then take the middle of the flat minimum
+  const fine = [];
+  for (let o = best - 2 * step - 300; o <= best + 2 * step + 300; o += 1) fine.push([o, cost(S, dots, o)]);
+  bestC = Math.min(...fine.map(f => f[1]));
+  const flat = fine.filter(f => f[1] <= bestC + 1).map(f => f[0]);
+  return (flat[0] + flat[flat.length - 1]) / 2;
+}
+
+// ---------- Fixations (I-DT) ----------
+function fixations(S, thr, minDur) {
+  const F = []; let i = 0;
+  const disp = (a, b) => { let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9; for (let k = a; k <= b; k++) { x0 = Math.min(x0, S[k].x); x1 = Math.max(x1, S[k].x); y0 = Math.min(y0, S[k].y); y1 = Math.max(y1, S[k].y); } return (x1 - x0) + (y1 - y0); };
+  while (i < S.length) {
+    let j = i; while (j < S.length && S[j].g - S[i].g < minDur) j++;
+    if (j >= S.length) break;
+    if (disp(i, j) <= thr) {
+      while (j + 1 < S.length && disp(i, j + 1) <= thr) j++;
+      let sx = 0, sy = 0; for (let k = i; k <= j; k++) { sx += S[k].x; sy += S[k].y; }
+      F.push({ g0: S[i].g, g1: S[j].g, x: sx / (j - i + 1), y: sy / (j - i + 1) }); i = j + 1;
+    } else i++;
+  }
+  return F;
+}
+
+// ---------- Regions ----------
+const inBox = (x, y, b, m) => b && x >= b[0] - m && x <= b[0] + b[2] + m && y >= b[1] - m && y <= b[1] + b[3] + m;
+function regionFn(block, stim, m) {
+  if (block === 'sort') {
+    const kL = stim.kiki_side === 'left';
+    return (x, y) => {
+      if (inBox(x, y, stim.house_left, 0)) return kL ? 'house_kiki' : 'house_bouba';
+      if (inBox(x, y, stim.house_right, 0)) return kL ? 'house_bouba' : 'house_kiki';
+      if (!inBox(x, y, stim.bbox, m)) return 'none';
+      if (stim.hybrid && stim.sector_center != null) {
+        let a = Math.atan2(y - stim.cy, x - stim.cx) - stim.sector_center;
+        a = Math.atan2(Math.sin(a), Math.cos(a));
+        return Math.abs(a) <= stim.sector_half ? 'spiky' : 'round';
+      }
+      return 'shape';
+    };
+  }
+  return (x, y) => {
+    for (const s of stim) if (inBox(x, y, s.aoi, m)) return s.target ? 'target' : 'other';
+    return 'none';
+  };
+}
+const REGIONS = ['target', 'other', 'shape', 'spiky', 'round', 'house_kiki', 'house_bouba'];
+
+// ---------- Main ----------
+function run() {
+  const S = gazeSamples();
+  if (!S.length) { alert('No valid gaze samples. Check the column choices.'); return; }
+  const dots = dotWindows();
+  const ov = $('offsetOverride').value.trim();
+  let offset;
+  if (ov !== '') offset = +ov;
+  else if (dots.length >= 3) offset = findOffset(S, dots);
+  else { alert('The game log has no follow-the-dot phase, so automatic sync is not possible. Enter an offset manually.'); return; }
+  for (const s of S) s.g = s.T - offset;
+
+  // sync report
+  const dotRows = dots.map((d, i) => {
+    const w = S.filter(s => s.g >= d.g0 && s.g <= d.g1);
+    const err = w.map(s => Math.hypot(s.x - d.x, s.y - d.y)).sort((a, b) => a - b);
+    const mx = w.reduce((a, s) => a + s.x, 0) / (w.length || 1), my = w.reduce((a, s) => a + s.y, 0) / (w.length || 1);
+    return { i, x: d.x, y: d.y, n: w.length, med: err.length ? err[err.length >> 1] : NaN, bx: mx - d.x, by: my - d.y, w };
+  });
+  const medAll = dotRows.map(r => r.med).filter(isFinite).sort((a, b) => a - b);
+  const med = medAll[medAll.length >> 1];
+  const good = med < 60;
+  $('syncText').innerHTML = `Clock offset: <b>${offset.toFixed(1)} ms</b> (tracker time minus game time).
+    Median gaze error during the dot phase: <b class="${good ? 'ok' : 'bad'}">${isFinite(med) ? med.toFixed(0) : 'n/a'} px</b>
+    ${good ? '. Looks good.' : '. Too large: check coordinates, scale and flip Y, or recalibrate the tracker.'}`;
+  $('dotTable').innerHTML = '<tr><th>Dot</th><th>Target x, y</th><th>Samples</th><th>Median error px</th><th>Mean bias x, y px</th></tr>' +
+    dotRows.map(r => `<tr><td>${r.i + 1}</td><td>${r.x}, ${r.y}</td><td>${r.n}</td><td>${isFinite(r.med) ? r.med.toFixed(0) : '-'}</td><td>${r.bx.toFixed(0)}, ${r.by.toFixed(0)}</td></tr>`).join('');
+  drawDots(dotRows);
+  $('syncCard').hidden = false;
+
+  // trials
+  const thr = +$('thr').value, minDur = +$('minDur').value, margin = +$('margin').value;
+  const trials = [], samplesOut = [];
+  for (const r of dotRows) for (const s of r.w) samplesOut.push({ pid: game.pid, t_game_ms: +s.g.toFixed(1), x: +s.x.toFixed(1), y: +s.y.toFixed(1), block: 'dot', trial: r.i, region: '' });
+  for (const on of game.recs.filter(r => r.event === 'stim_on')) {
+    const resp = game.recs.find(r => r.event === 'response' && +r.trial === +on.trial);
+    if (!resp) continue;
+    const g0 = on.t_ms, g1 = on.t_ms + +resp.rt_ms;
+    const region = regionFn(on.block, on.stim, margin);
+    const w = S.filter(s => s.g >= g0 && s.g <= g1);
+    for (const s of w) samplesOut.push({ pid: game.pid, t_game_ms: +s.g.toFixed(1), x: +s.x.toFixed(1), y: +s.y.toFixed(1), block: on.block, trial: on.trial, region: region(s.x, s.y) });
+    const F = fixations(w, thr, minDur).map(f => ({ ...f, region: region(f.x, f.y) }));
+    const row = { pid: game.pid, trial: +on.trial, block: on.block, rt_ms: +resp.rt_ms, correct: resp.correct,
+      choice: resp.choice || '', m: on.block === 'sort' ? on.stim.m : '', hybrid: on.block === 'sort' ? (on.stim.hybrid ? 1 : 0) : '',
+      n_samples: w.length, n_fix: F.length };
+    const real = F.filter(f => f.region !== 'none');
+    row.first_region = real[0]?.region || '';
+    row.last_region = real[real.length - 1]?.region || '';
+    for (const R of REGIONS) {
+      const fr = F.filter(f => f.region === R);
+      row['ttff_' + R] = fr.length ? +(fr[0].g0 - g0).toFixed(0) : '';
+      row['dwell_' + R] = fr.length ? +fr.reduce((a, f) => a + f.g1 - f.g0, 0).toFixed(0) : '';
+    }
+    trials.push(row);
+  }
+  const cols = ['pid', 'trial', 'block', 'm', 'hybrid', 'choice', 'correct', 'rt_ms', 'n_samples', 'n_fix', 'first_region', 'last_region',
+    ...REGIONS.flatMap(R => ['ttff_' + R, 'dwell_' + R])];
+  const used = cols.filter(c => trials.some(t => t[c] !== '' && t[c] != null) || ['pid', 'trial', 'block'].includes(c));
+  $('resTable').innerHTML = '<tr>' + used.map(c => `<th>${c}</th>`).join('') + '</tr>' +
+    trials.map(t => '<tr>' + used.map(c => `<td>${t[c] ?? ''}</td>`).join('') + '</tr>').join('');
+  $('resCard').hidden = false;
+  result = { trials, cols, samplesOut, offset };
+  return result;
+}
+function drawDots(rows) {
+  const c = $('dotCanvas'), ctx = c.getContext('2d');
+  c.height = Math.round(c.width * game.H / game.W);
+  const k = c.width / game.W;
+  ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, c.width, c.height);
+  rows.forEach((r, i) => {
+    ctx.fillStyle = `hsl(${40 + i * 33}, 80%, 60%)`;
+    for (const s of r.w) ctx.fillRect(s.x * k - 1, s.y * k - 1, 2, 2);
+    ctx.strokeStyle = '#c00'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(r.x * k, r.y * k, 9, 0, Math.PI * 2); ctx.stroke();
+  });
+}
+$('run').onclick = run;
+$('dlTrials').onclick = () => download(`gaze_trials_${game.pid}.csv`, toCSV(result.cols, result.trials));
+$('dlSamples').onclick = () => download(`gaze_samples_${game.pid}.csv`, toCSV(['pid', 't_game_ms', 'x', 'y', 'block', 'trial', 'region'], result.samplesOut));
+</script>
+</body>
+</html>
