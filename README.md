@@ -29,4 +29,20 @@ A short warm-up task for getting participants used to an eye tracker (SCI 6384, 
 
 Edit the `CFG` block at the top of the script to change timings or the number of trials.
 
-The game does not connect to the eye tracker. Record gaze in the tracker software and align it using the sync patch and timestamps.
+## Aligning gaze data: `align.html`
+
+The game does not connect to the eye tracker. Record gaze in the tracker software as usual, then open the aligner:
+
+**https://yvettege728.github.io/kiki-bouba-pilot/align.html** (runs in the browser, nothing is uploaded)
+
+1. Drop the game CSV and the tracker's gaze export (CSV or TSV: Tobii Pro Lab, Gazepoint, Pupil Labs and similar exports are auto-detected)
+2. Check the detected columns, time unit and coordinate type
+3. Click **Align and compute**
+
+How it syncs: the follow-the-dot phase is the sync signal. The aligner searches for the clock offset at which gaze best lands on the 9 dots, so no hardware trigger is needed. Expected timing precision is about ±50 ms (individual saccade latency is unknown). The sync check plot and the median error in pixels show whether the alignment and calibration are good. Above about 60 px, check the coordinate settings or recalibrate.
+
+Outputs:
+- **Trial metrics CSV**: per trial, time to first fixation and dwell time per region (target / other in rounds 1 and 2; spiky half / round half of hybrid shapes, shape, kiki house, bouba house in round 3), first and last region looked at, accuracy, RT
+- **Aligned samples CSV**: every gaze sample in game time with its trial and region
+
+Note on round 3: the shape appears where the fixation cross was, so gaze starts on the shape. Use dwell on the spiky vs. round half and the last region before the response, not time to first fixation.
