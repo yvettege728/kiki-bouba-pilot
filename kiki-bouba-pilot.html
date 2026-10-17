@@ -39,7 +39,8 @@ const CFG = {
 // ---------- Setup ----------
 const cv = document.getElementById('c'), ctx = cv.getContext('2d'), ui = document.getElementById('ui');
 let W, H;
-function resize() { W = cv.width = innerWidth; H = cv.height = innerHeight; }
+// Some browsers briefly report a 0 size (e.g. while entering full screen); keep the last valid size then
+function resize() { if (innerWidth > 0 && innerHeight > 0) { W = cv.width = innerWidth; H = cv.height = innerHeight; } }
 resize(); addEventListener('resize', resize);
 
 const log = [];
@@ -174,7 +175,8 @@ async function runChoiceTrial(tr, idx) {
   await wait(CFG.fixMs);
 
   const keys = ['f', 'j'];
-  const size = Math.min(W / 3 * 0.36, H * 0.2), cy = H / 2;
+  // Kept small enough that AOIs (plus margin) stay clear of the central fixation cross
+  const size = Math.min(W / 3 * 0.25, H * 0.17), cy = H / 2;
   const shapes = [];
   clear();
   for (let i = 0; i < 2; i++) {
@@ -249,8 +251,9 @@ async function runSortTrial(tr, idx) {
   draw(0, 0);
 
   const stim = { m: tr.m, hybrid: tr.hybrid, k: p.k, amp: +p.amp.toFixed(2), jitter: +p.jitter.toFixed(2),
-    kiki_side: kikiSide, bbox: bbox(pts), house_left: hs.left.rect, house_right: hs.right.rect };
+    kiki_side: kikiSide, cx: Math.round(W / 2), cy: Math.round(H / 2), bbox: bbox(pts), house_left: hs.left.rect, house_right: hs.right.rect };
   if (tr.hybrid) {
+    stim.sector_center = +p.sector.center.toFixed(4); stim.sector_half = +p.sector.half.toFixed(4);
     stim.aoi_spiky = bbox(pts.filter((_, i) => g.local[i] > 0.5));
     stim.aoi_round = bbox(pts.filter((_, i) => g.local[i] <= 0.5));
   }
