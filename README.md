@@ -8,6 +8,10 @@ A short warm-up task for getting participants used to an eye tracker (SCI 6384, 
 
 ## Flow (about 3 min)
 
+![Pilot flow: game steps, parallel eye-tracker recording, and the gaze aligner](flowchart.png)
+
+Vector version: [flowchart.svg](flowchart.svg)
+
 1. Follow the dot: 9 positions, 1.5 s each (accuracy check against the tracker)
 2. Practice: 2 trials with feedback
 3. Round 1, easy: clear kiki vs. bouba, keys `F` / `J`
