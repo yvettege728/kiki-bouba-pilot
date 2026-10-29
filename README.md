@@ -50,3 +50,14 @@ Outputs:
 - **Aligned samples CSV**: every gaze sample in game time with its trial and region
 
 Note on round 3: the shape appears where the fixation cross was, so gaze starts on the shape. Use dwell on the spiky vs. round half and the last region before the response, not time to first fixation.
+
+## Pupil Labs Neon recordings: `analysis/neon_align.py`
+
+Neon is head-mounted, so gaze comes in scene-camera pixels and the screen moves in the view. `align.html` cannot map that; use this script instead. It finds the screen in every scene-video frame (the game's gray background shows up as a saturated quad), corrects lens distortion, maps gaze and Neon's own fixations to game screen pixels, syncs clocks (wall-clock UTC, refined on the follow-the-dot phase) and writes per-trial metrics with the same regions as `align.html`, plus a `switches` count and a `prompt` region.
+
+```
+pip install opencv-python-headless numpy
+python analysis/neon_align.py <neon_export_folder> <game_log.csv> <out_folder>
+```
+
+Input: the Neon "Timeseries Data + Scene Video" export (needs `gaze.csv`, `fixations.csv`, `world_timestamps.csv`, `scene_camera.json` and the `.mp4`). Do not commit participant data to this repo.
