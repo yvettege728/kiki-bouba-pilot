@@ -57,12 +57,17 @@ def find_screen(img):
     if not cs: return None
     c = max(cs, key=cv2.contourArea)
     if cv2.contourArea(c) < 0.02 * img.shape[0] * img.shape[1]: return None
-    hull = cv2.convexHull(c).reshape(-1, 2).astype(float)
+    raw = c.reshape(-1, 2)
+    # the screen must not be cut off by the frame edge, or its corners are unknown
+    h_img, w_img = img.shape[:2]
+    if ((raw[:, 0] <= 2) | (raw[:, 0] >= w_img - 3) | (raw[:, 1] <= 2) | (raw[:, 1] >= h_img - 3)).mean() > 0.01: return None
+    # undistort the outline first so the screen edges become straight lines
+    pts = undist(raw[::2])
+    hull = cv2.convexHull(pts.astype(np.float32)).reshape(-1, 2).astype(float)
     s, d = hull.sum(1), hull[:, 0] - hull[:, 1]
     quad = np.array([hull[s.argmin()], hull[d.argmax()], hull[s.argmax()], hull[d.argmin()]])  # tl tr br bl
     # refine: fit a line to the middle of each side, intersect neighbours
     # (robust to the small black sync patch cutting the bottom-left corner)
-    pts = c.reshape(-1, 2).astype(float)
     lines = []
     for i in range(4):
         a, b = quad[i], quad[(i + 1) % 4]
@@ -70,7 +75,7 @@ def find_screen(img):
         if L < 10: return None
         t = ((pts - a) @ ab) / L**2
         dist = np.abs(ab[0] * (pts[:, 1] - a[1]) - ab[1] * (pts[:, 0] - a[0])) / L
-        sel = pts[(t > 0.15) & (t < 0.85) & (dist < 12)]
+        sel = pts[(t > 0.15) & (t < 0.85) & (dist < max(12, 0.03 * L))]
         if len(sel) < 10: return None
         lines.append(cv2.fitLine(sel.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel())
     return np.array([line_intersect(lines[(i - 1) % 4], lines[i]) for i in range(4)])
@@ -82,7 +87,7 @@ while True:
     ok, img = cap.read()
     if not ok: break
     q = find_screen(img)
-    corners.append(None if q is None else undist(q))
+    corners.append(q)   # already in undistorted pixels
     i += 1
 cap.release()
 n_found = sum(q is not None for q in corners)
@@ -135,7 +140,18 @@ print(f'wall-clock sync refined by {extra:+.0f} ms; dot-phase mean error {cs.min
 def g_time(utc):   # utc ms -> game ms
     return utc - game0_utc - extra
 
-# per-dot accuracy and bias
+# constant offset correction: median gaze bias over the dots (e.g. glasses sitting slightly off)
+bias = []
+for g0, g1, x, y in dots:
+    a, b = np.searchsorted(G_t, [game0_utc + g0 + extra, game0_utc + g1 + extra])
+    if b - a >= 5: bias.append(np.median(G_xy[a:b] - [x, y], axis=0))
+bias = np.median(bias, axis=0) if len(bias) >= 4 else np.zeros(2)
+G_xy = G_xy - bias
+gaze = [(t, x - bias[0], y - bias[1]) for t, x, y in gaze]
+fix = [(a, b, x - bias[0], y - bias[1]) for a, b, x, y in fix]
+print(f'offset correction: x {-bias[0]:+.0f} px, y {-bias[1]:+.0f} px')
+
+# per-dot accuracy and bias (after correction)
 dot_rows = []
 for k, (g0, g1, x, y) in enumerate(dots):
     a, b = np.searchsorted(G_t, [game0_utc + g0 + extra, game0_utc + g1 + extra])
@@ -202,5 +218,5 @@ with open(os.path.join(OUT, f'gaze_samples_{pid}.csv'), 'w', newline='') as f:
     w = csv.writer(f); w.writerow(['t_game_ms', 'x', 'y'])
     for t, x, y in gaze: w.writerow([round(g_time(t), 1), round(x, 1), round(y, 1)])
 json.dump({'pid': pid, 'frames': len(corners), 'screen_found': n_found, 'sync_extra_ms': extra,
-           'dot_error_px': round(float(cs.min()), 1)}, open(os.path.join(OUT, f'sync_{pid}.json'), 'w'), indent=2)
+           'dot_error_px': round(float(cs.min()), 1), 'offset_correction_px': [round(-float(bias[0]), 1), round(-float(bias[1]), 1)]}, open(os.path.join(OUT, f'sync_{pid}.json'), 'w'), indent=2)
 print('wrote', OUT)

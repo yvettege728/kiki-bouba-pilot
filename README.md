@@ -61,3 +61,13 @@ python analysis/neon_align.py <neon_export_folder> <game_log.csv> <out_folder>
 ```
 
 Input: the Neon "Timeseries Data + Scene Video" export (needs `gaze.csv`, `fixations.csv`, `world_timestamps.csv`, `scene_camera.json` and the `.mp4`). Do not commit participant data to this repo.
+
+### Pooling everything: `analysis/summarize.py`
+
+```
+python analysis/summarize.py <folder with kikibouba_*.csv game logs> <folder with gaze_trials_*.csv>
+```
+
+Joins every game log with the gaze metrics that exist, and writes `all_trials.csv`, `hybrid_trials.csv` and `pilot_summary.png` (habituation curve, rounds 1 vs 2 gaze, round 3 categorisation curve, hybrids last look vs answer).
+
+Neon tip: participants who sit very close to the laptop push the screen edges out of the scene camera. Those frames cannot be mapped. Keep about 60 cm and check the scene view before starting.
