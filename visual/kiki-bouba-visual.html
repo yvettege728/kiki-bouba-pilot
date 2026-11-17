@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kiki Bouba Visual</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #808080; overflow: hidden;
+    font-family: -apple-system, Helvetica, Arial, sans-serif; color: #111; }
+  body.running { cursor: none; }
+  canvas { display: block; }
+  #ui { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; }
+  #ui:empty { display: none; }
+  .card { max-width: 680px; padding: 32px; font-size: 20px; line-height: 1.55; }
+  .card h1 { font-size: 32px; margin: 0 0 12px; }
+  button { font-size: 18px; padding: 10px 20px; margin: 8px; border: 0; border-radius: 8px; background: #111; color: #fff; cursor: pointer; }
+  input { font-size: 18px; padding: 8px; width: 220px; border-radius: 6px; border: 1px solid #444; }
+  kbd { background: #eee; border-radius: 4px; padding: 1px 7px; font-family: inherit; }
+  .small { font-size: 15px; opacity: .75; }
+  .ok { color: #063; } .bad { color: #900; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui"></div>
+<script>
+// ===================== Config (edit here) =====================
+const CFG = {
+  fixMs: 1000,          // fixation cross before every trial
+  blankMs: 500,         // blank after every trial
+  observeMs: 5000,      // phase 1: look at the shape, keys locked, countdown shown
+  timeoutMs: 3000,      // phase 2: answer window for kiki/bouba (shape stays on screen)
+  confTimeoutMs: 8000,  // max time for the 1-5 confidence rating
+  dotMs: 1500,          // time per follow-the-dot target (tracker validation)
+  tagFrac: 0.12,        // AprilTag size as fraction of the shorter screen side
+  stimHeightFrac: 0.5,  // every image is drawn at this fraction of screen height
+  // Stimulus numbers follow Table I: 1 = 100% angular (kiki) ... 11 = 0% angular (bouba).
+  // Images are loaded from stimuli/s01.png ... stimuli/s11.png next to this file.
+  stimPath: n => `stimuli/s${String(n).padStart(2, '0')}.png`,
+  // One fixed order for every participant (3 rounds x 11).
+  // Rules: neighbours differ by 3-8 levels, same shape >= 5 trials apart, no neighbour pair repeats.
+  order: [
+    [4, 7, 1, 5, 2, 9, 3, 8, 11, 6, 10],
+    [2, 7, 3, 11, 4, 9, 6, 1, 8, 5, 10],
+    [3, 6, 2, 8, 4, 10, 7, 11, 5, 9, 1],
+  ],
+};
+const angularPct = n => (11 - n) * 10;   // stimulus 1 -> 100, stimulus 11 -> 0
+
+// ===================== Setup =====================
+const cv = document.getElementById('c'), ctx = cv.getContext('2d'), ui = document.getElementById('ui');
+let W, H;
+function resize() { if (innerWidth > 0 && innerHeight > 0) { W = cv.width = innerWidth; H = cv.height = innerHeight; } }
+resize(); addEventListener('resize', resize);
+
+const log = [];
+let pid = '', t0 = 0, aborted = false, kikiSide = 'left';
+const IMG = {};   // stimulus number -> HTMLImageElement
+const now = () => performance.now();
+const unixMs = () => performance.timeOrigin + performance.now();
+// Optional: send each event to the Neon Companion app (same Wi-Fi) so it appears on the recording timeline.
+let neonIp = '';
+function neonEvent(name) {
+  if (!neonIp) return;
+  const body = JSON.stringify({ name, timestamp: Math.round(unixMs() * 1e6) });
+  fetch(`http://${neonIp}:8080/api/event`, { method: 'POST', mode: 'no-cors', body }).catch(() => {});
+}
+function rec(o) {
+  log.push(Object.assign({ pid, t_ms: +(now() - t0).toFixed(1), unix_ms: +unixMs().toFixed(1), wall: new Date().toISOString() }, o));
+  if (o.event) neonEvent([o.event, o.block, o.stim_n].filter(v => v != null).join('.'));
+  try { localStorage.setItem('kbv_backup_' + pid, JSON.stringify(log)); } catch (e) {}
+}
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const frame = () => new Promise(requestAnimationFrame);
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+// AprilTags (tag36h11, IDs 0-3) in the four screen corners, always visible.
+// Pupil Cloud's Marker Mapper uses them to map Neon gaze onto screen coordinates.
+const TAGS = [
+  '0000000000011111111001001010100110001010011001111001010111100110100110011110111001111111100000000000',
+  '0000000000011111111001001001100110100010010000111001100111100101001010011101101001111111100000000000',
+  '0000000000011111111001001000100110110110010111111001110110100111101110011100011001111111100000000000',
+  '0000000000011111111001000110100111100010010110001001010110100100110110011001111001111111100000000000',
+];
+function tagSize() { return Math.round(Math.min(W, H) * CFG.tagFrac); }
+function tagRects() {   // [x, y, size] for IDs 0 (top-left), 1 (top-right), 2 (bottom-right), 3 (bottom-left)
+  const s = tagSize(), m = 0;
+  return [[m, m, s], [W - s - m, m, s], [W - s - m, H - s - m, s], [m, H - s - m, s]];
+}
+function drawTags() {
+  tagRects().forEach(([x, y, s], id) => {
+    const c = s / 12;                       // 10x10 tag (incl. 1-cell white border) + 1 extra white cell each side
+    ctx.fillStyle = '#fff'; ctx.fillRect(x, y, s, s);
+    ctx.fillStyle = '#000';
+    for (let i = 0; i < 100; i++) if (TAGS[id][i] === '1')
+      ctx.fillRect(Math.floor(x + c * (1 + i % 10)), Math.floor(y + c * (1 + Math.floor(i / 10))), Math.ceil(c), Math.ceil(c));
+  });
+}
+function clear() { ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, W, H); drawTags(); }
+// Sync patch (bottom-centre): white while a stimulus is on screen. Visible in the Neon
+// scene video, so trial onsets can be checked frame by frame.
+function sync(on) { ctx.fillStyle = on ? '#fff' : '#000'; ctx.fillRect(W / 2 - 20, H - 40, 40, 40); }
+function cross() {
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 3; ctx.beginPath();
+  ctx.moveTo(W / 2 - 15, H / 2); ctx.lineTo(W / 2 + 15, H / 2);
+  ctx.moveTo(W / 2, H / 2 - 15); ctx.lineTo(W / 2, H / 2 + 15); ctx.stroke();
+}
+function text(s, x, y, size = 22, weight = '') {
+  ctx.fillStyle = '#111'; ctx.font = `${weight} ${size}px -apple-system, Helvetica, Arial`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(s, x, y);
+}
+
+// ===================== Images =====================
+function loadImg(src) {
+  return new Promise(res => { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = src; });
+}
+async function loadFromFolder() {
+  const missing = [];
+  for (let n = 1; n <= 11; n++) { const im = await loadImg(CFG.stimPath(n)); if (im) IMG[n] = im; else missing.push(n); }
+  return missing;
+}
+// Fallback: researcher picks the 11 files by hand (names must contain 01..11)
+async function loadFromPicker(files) {
+  for (const f of files) {
+    const m = f.name.match(/(\d{1,2})/); if (!m) continue;
+    const n = +m[1]; if (n < 1 || n > 11) continue;
+    const im = await loadImg(URL.createObjectURL(f)); if (im) IMG[n] = im;
+  }
+  return [...Array(11).keys()].map(i => i + 1).filter(n => !IMG[n]);
+}
+// Same height for every image, aspect ratio kept, centred on screen
+function stimRect(im) {
+  const h = H * CFG.stimHeightFrac, w = h * im.naturalWidth / im.naturalHeight;
+  return [Math.round(W / 2 - w / 2), Math.round(H / 2 - h / 2), Math.round(w), Math.round(h)];
+}
+
+// ===================== Input =====================
+function waitKey(keys, timeout) {
+  return new Promise(res => {
+    let done = false;
+    const h = e => {
+      const k = e.key.toLowerCase();
+      if (k === 'escape') { aborted = true; finish(null); return; }
+      if (keys.includes(k)) finish(k);
+    };
+    const to = timeout ? setTimeout(() => finish(null), timeout) : null;
+    function finish(k) { if (done) return; done = true; removeEventListener('keydown', h); if (to) clearTimeout(to); res({ key: k, t: now() }); }
+    addEventListener('keydown', h);
+  });
+}
+function screen(html) {
+  ui.innerHTML = `<div class="card">${html}<p class="small">Press <kbd>Space</kbd> to continue</p></div>`;
+  document.body.classList.remove('running');
+  return waitKey([' ']).then(() => { ui.innerHTML = ''; document.body.classList.add('running'); });
+}
+
+// ===================== Follow the dot (tracker validation) =====================
+async function followDot(tag) {
+  resize();
+  const pos = [];
+  for (const fy of [0.2, 0.5, 0.8]) for (const fx of [0.2, 0.5, 0.8]) pos.push([fx, fy]);   // kept clear of the corner tags
+  shuffle(pos);
+  for (let i = 0; i < pos.length && !aborted; i++) {
+    const x = pos[i][0] * W, y = pos[i][1] * H;
+    rec({ event: 'dot_on', trial: i, block: tag, stim: JSON.stringify({ x: Math.round(x), y: Math.round(y) }) });
+    const start = now();
+    while (now() - start < CFG.dotMs) {
+      const p = (now() - start) / CFG.dotMs;
+      clear(); sync(true);
+      ctx.fillStyle = '#c00'; ctx.beginPath(); ctx.arc(x, y, 18 - 12 * p, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+      await frame();
+    }
+    rec({ event: 'dot_off', trial: i, block: tag });
+  }
+  clear(); sync(false);
+}
+
+// ===================== Key practice (no shapes, so nothing is primed) =====================
+async function keyPractice() {
+  const steps = [
+    { label: 'LEFT word', keys: ['f'] }, { label: 'RIGHT word', keys: ['j'] },
+    { label: 'confidence 1', keys: ['1'] }, { label: 'confidence 5', keys: ['5'] },
+  ];
+  for (const s of steps) {
+    if (aborted) return;
+    clear(); text(`Press the key for: ${s.label}`, W / 2, H / 2 - 30, 26);
+    text(s.keys[0] === 'f' ? 'F' : s.keys[0] === 'j' ? 'J' : s.keys[0], W / 2, H / 2 + 30, 22);
+    await waitKey(s.keys);
+    clear(); text('OK', W / 2, H / 2, 26); await wait(400);
+  }
+  clear();
+}
+
+// ===================== One trial =====================
+function labels() { return kikiSide === 'left' ? { f: 'kiki', j: 'bouba' } : { f: 'bouba', j: 'kiki' }; }
+function drawLabels(active = true) {
+  const L = labels();
+  ctx.globalAlpha = active ? 1 : 0.3;   // greyed out while keys are locked
+  text(L.f.toUpperCase(), W * 0.15, H / 2, 34, '600'); text('F', W * 0.15, H / 2 + 44, 18);
+  text(L.j.toUpperCase(), W * 0.85, H / 2, 34, '600'); text('J', W * 0.85, H / 2 + 44, 18);
+  ctx.globalAlpha = 1;
+}
+// Countdown number at the top centre, away from the shape and the labels
+function drawCountdown(sec, phase) {
+  text(phase === 'observe' ? 'Look' : 'Choose now', W / 2, H * 0.1, 22);
+  text(String(sec), W / 2, H * 0.1 + 38, 30, '600');
+}
+// Draw the trial screen for a given phase and seconds left
+function trialFrame(im, rect, phase, sec) {
+  clear(); ctx.drawImage(im, rect[0], rect[1], rect[2], rect[3]);
+  drawLabels(phase === 'choose'); drawCountdown(sec, phase); sync(true);
+}
+
+async function runTrial(n, idx, round) {
+  resize();
+  const base = { trial: idx, block: 'round' + round, stim_n: n, angular_pct: angularPct(n) };
+
+  clear(); sync(false); cross();
+  rec({ event: 'fixation', ...base });
+  await wait(CFG.fixMs);
+  if (aborted) return null;
+
+  const im = IMG[n], rect = stimRect(im);
+
+  // Phase 1: observe. Keys are locked; early presses are only logged.
+  const stimOn = now();
+  rec({ event: 'stim_on', ...base, kiki_side: kikiSide,
+        stim: JSON.stringify({ file: CFG.stimPath(n), rect, label_left: [Math.round(W * 0.15), Math.round(H / 2)], label_right: [Math.round(W * 0.85), Math.round(H / 2)] }) });
+  let early = 0;
+  const earlyH = e => { const k = e.key.toLowerCase(); if (k === 'escape') aborted = true; else if (k === 'f' || k === 'j') { early++; rec({ event: 'early_press', ...base, key: k }); } };
+  addEventListener('keydown', earlyH);
+  let shown = -1;
+  while (now() - stimOn < CFG.observeMs && !aborted) {
+    const sec = Math.ceil((CFG.observeMs - (now() - stimOn)) / 1000);
+    if (sec !== shown) { trialFrame(im, rect, 'observe', sec); shown = sec; }
+    await frame();
+  }
+  removeEventListener('keydown', earlyH);
+  if (aborted) return null;
+
+  // Phase 2: choose within the answer window. RT counts from the start of this phase.
+  const onset = now();
+  rec({ event: 'choose_on', ...base });
+  trialFrame(im, rect, 'choose', Math.ceil(CFG.timeoutMs / 1000));
+  let tick = true;
+  (async () => {   // update the countdown while waiting for the key
+    while (tick) {
+      const left = CFG.timeoutMs - (now() - onset);
+      if (left <= 0) break;
+      const sec = Math.ceil(left / 1000);
+      if (sec !== shown) { trialFrame(im, rect, 'choose', sec); shown = sec; }
+      await frame();
+    }
+  })();
+  const r = await waitKey(['f', 'j'], CFG.timeoutMs);
+  tick = false;
+  const choice = r.key ? labels()[r.key] : 'timeout';
+  const rt = +(r.t - onset).toFixed(1);
+  rec({ event: 'response', ...base, key: r.key || 'timeout', choice, rt_ms: rt, early_presses: early });
+  if (aborted) return null;
+
+  // Confidence 1-5 (shape removed so gaze data stops at the decision)
+  let conf = null, confRt = null;
+  if (r.key) {
+    clear(); sync(false);
+    text('How sure are you?', W / 2, H / 2 - 70, 28);
+    for (let c = 1; c <= 5; c++) text(String(c), W / 2 + (c - 3) * 90, H / 2, 40, '600');
+    text('not sure at all', W / 2 - 180, H / 2 + 50, 16); text('very sure', W / 2 + 180, H / 2 + 50, 16);
+    const c0 = now();
+    const cr = await waitKey(['1', '2', '3', '4', '5'], CFG.confTimeoutMs);
+    conf = cr.key ? +cr.key : null; confRt = +(cr.t - c0).toFixed(1);
+    rec({ event: 'confidence', ...base, key: cr.key || 'timeout', confidence: conf, rt_ms: confRt });
+  }
+
+  clear(); sync(false);
+  await wait(CFG.blankMs);
+  return { n, round, choice, rt, conf, timeout: !r.key, early };
+}
+
+// ===================== Flow =====================
+async function main() {
+  t0 = now();
+  rec({ event: 'session_start', stim: JSON.stringify({ W, H, dpr: devicePixelRatio, ua: navigator.userAgent, kiki_side: kikiSide, order: CFG.order }) });
+
+  await screen(`<h1>Warm-up</h1>A red dot will jump around the screen.<br>Just <b>follow it with your eyes</b>. Keep your head still.`);
+  await followDot('dot_pre');
+
+  await screen(`<h1>Kiki or Bouba?</h1>"Kiki" and "Bouba" are two made-up words.<br>
+    You will see one shape at a time. First just <b>look at it for 5 seconds</b> (keys are locked).<br>Then you have <b>3 seconds</b> to choose which word fits it better.<br>
+    <kbd>F</kbd> = the word on the left, <kbd>J</kbd> = the word on the right.<br>
+    Then rate how sure you are: <kbd>1</kbd> (not sure at all) to <kbd>5</kbd> (very sure).<br>
+    There are no right or wrong answers. Go with your first impression.<br>
+    Look at the <b>cross</b> whenever it appears.<br><br>First, a quick key check.`);
+  await keyPractice();
+
+  const results = [];
+  let idx = 0;
+  for (let r = 0; r < CFG.order.length && !aborted; r++) {
+    if (r > 0) await screen(`<h1>Short break</h1>Round ${r + 1} of ${CFG.order.length}. Same task.`);
+    rec({ event: 'block_start', block: 'round' + (r + 1) });
+    for (const n of CFG.order[r]) {
+      if (aborted) break;
+      const res = await runTrial(n, idx++, r + 1);
+      if (res) results.push(res);
+    }
+  }
+  // (post-session dot check removed: not needed)
+  rec({ event: aborted ? 'session_aborted' : 'session_end' });
+  end(results);
+}
+
+function end(results) {
+  document.body.classList.remove('running'); clear();
+  let rows = '';
+  for (let n = 1; n <= 11; n++) {
+    const r = results.filter(x => x.n === n && !x.timeout);
+    const k = r.filter(x => x.choice === 'kiki').length;
+    const c = r.filter(x => x.conf).map(x => x.conf);
+    rows += `<tr><td>${n}</td><td>${angularPct(n)}%</td><td>${r.length ? k + ' / ' + r.length : '-'}</td><td>${c.length ? (c.reduce((a, b) => a + b, 0) / c.length).toFixed(1) : '-'}</td></tr>`;
+  }
+  const to = results.filter(x => x.timeout).length;
+  ui.innerHTML = `<div class="card"><h1>${aborted ? 'Stopped' : 'Done, thank you!'}</h1>
+    <table style="margin:0 auto 8px;border-spacing:16px 2px;font-size:16px"><tr><th>Stim</th><th>Angular</th><th>Kiki</th><th>Mean conf.</th></tr>${rows}</table>
+    <p class="small">Timeouts: ${to}. Kiki side: ${kikiSide}.</p>
+    <button id="csv">Download CSV</button><button id="json">Download JSON</button>
+    <p class="small">Data is also backed up in this browser under key kbv_backup_${pid}.</p></div>`;
+  document.getElementById('csv').onclick = () => download('csv');
+  document.getElementById('json').onclick = () => download('json');
+}
+
+function download(kind) {
+  const cols = ['pid', 't_ms', 'unix_ms', 'wall', 'event', 'trial', 'block', 'stim_n', 'angular_pct', 'kiki_side', 'key', 'choice', 'confidence', 'rt_ms', 'early_presses', 'stim'];
+  const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v;
+  const body = kind === 'csv'
+    ? [cols.join(','), ...log.map(r => cols.map(c => esc(r[c])).join(','))].join('\n')
+    : JSON.stringify(log, null, 2);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([body], { type: kind === 'csv' ? 'text/csv' : 'application/json' }));
+  a.download = `kikibouba_visual_${pid}_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.${kind}`;
+  a.click();
+}
+
+// ===================== Start screen =====================
+async function startScreen() {
+  clear();
+  const missing = await loadFromFolder();
+  const status = missing.length
+    ? `<p class="bad">Missing images: ${missing.join(', ')}<br><span class="small">Put s01.png ... s11.png in a "stimuli" folder next to this file, or pick the files here:</span><br><input type="file" id="pick" multiple accept="image/*" style="width:auto"></p>`
+    : `<p class="ok">All 11 images loaded.</p>`;
+  ui.innerHTML = `<div class="card"><h1>Kiki / Bouba: visual condition</h1>
+    <p>Pupil Neon: put the glasses on, start recording in the Companion app first.<br>
+      Sit about 60 cm from the screen, all four corner markers must be in view of the scene camera.</p>
+    <div id="status">${status}</div>
+    <p><input id="pid" placeholder="Participant ID (e.g. P01)"></p>
+    <p><input id="neon" placeholder="Neon phone IP (optional)"><br><span class="small">Shown in the Companion app under "Stream". Leave empty to skip.</span></p>
+    <button id="go">Start (full screen)</button>
+    <p class="small">Odd ID numbers get KIKI on the left, even ones on the right.<br><kbd>Esc</kbd> at any time stops the session and still lets you save data.</p></div>`;
+  const pick = document.getElementById('pick');
+  if (pick) pick.onchange = async () => {
+    const m = await loadFromPicker(pick.files);
+    document.getElementById('status').innerHTML = m.length ? `<p class="bad">Still missing: ${m.join(', ')}</p>` : `<p class="ok">All 11 images loaded.</p>`;
+  };
+  document.getElementById('go').onclick = async () => {
+    const miss = [...Array(11).keys()].map(i => i + 1).filter(n => !IMG[n]);
+    if (miss.length) { alert('Missing images: ' + miss.join(', ')); return; }
+    pid = document.getElementById('pid').value.trim() || 'anon';
+    neonIp = document.getElementById('neon').value.trim();
+    // Counterbalance label sides by participant number (odd = kiki left)
+    const num = parseInt((pid.match(/\d+/) || ['1'])[0], 10);
+    kikiSide = num % 2 === 1 ? 'left' : 'right';
+    try { await document.documentElement.requestFullscreen(); } catch (e) {}
+    await wait(400); resize(); ui.innerHTML = ''; main();
+  };
+}
+startScreen();
+</script>
+</body>
+</html>
